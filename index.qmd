@@ -388,9 +388,29 @@ end
 **Your answer:** How much do the trends differ between stations a few miles apart?
 Is that more likely a real difference in climate or noise from short records, and what in the table supports your answer?
 
+Galveston Scholes Field and GALVESTON are only 4.52 miles apart, but their fitted trends are +2.72% and −15.29%, respectively—a difference of about 18 percentage points. This difference is more likely due to sampling variability and differences in record coverage than a sharp local difference in climate. Scholes Field has only 21 years of observations, compared with 137 years at GALVESTON. However, the table alone cannot confirm this explanation. Comparing both stations over the same period and examining uncertainty intervals for their trends would help assess whether the difference reflects sampling variability.
+
+
 **Your answer:** How much does $x_t$ change over Scholes Field's 21 years, compared with a record that starts around 1900?
 So what sets Scholes Field's trend when you fit it alone?
 
+The $x_t$ increases 0.161 from 1997 to 2017, and increases 0.463 from 1900 to 2017. Scholes Field’s short record and small change in $x_t$ provide limited information about the trend. When fitted alone, the trend estimate is strongly affected by random variability in the short record.
+
+```{julia}
+x_at(yr) = only(co2.x[co2.year .== yr])
+
+
+Δx_short = x_at(2017) - x_at(1997)
+
+
+Δx_long = x_at(2017) - x_at(1900)
+
+@printf("Scholes Field Δx: %.3f\n", Δx_short)
+@printf("1900–2017 Δx: %.3f\n", Δx_long)
+@printf("Long-record change is %.2f times larger\n", Δx_long / Δx_short)
+
+
+```
 
 ## Borrowing from neighbors
 
@@ -484,8 +504,14 @@ end
 The weighted likelihood treats every station's value as independent.
 Which method keeps the 2017 values together, and which interval would you expect to be wider?
 
+17 kept station have a 2017 annual maximum: 8 on August 26, 6 on August 27, 2 on August 28, and 1 on August 29. The clustering of dates suggests that these observations likely reflect a shared storm event and are therefore dependent.
+The bootstrap over years keeps all the 2017 values together, preserving their dependence across stations. I would expect its interval to be wider than the MCMC interval.
+
 ```{julia}
-# Your code here
+data_2017 = filter(row -> row.year == 2017, ann_max_region)
+
+length(unique(data_2017.id))
+combine(groupby(data_2017, :date), nrow => :n_stations)
 ```
 
 
@@ -500,6 +526,229 @@ Then code one of the other weight functions and run it the same way.
 Which settings give an estimate dominated by variance, and which by bias?
 Name a physical reason a wide region could be biased for a station on Galveston Island.
 
+Here, $d$ is distance from Scholes Field in miles. The pooled trend is the percentage change from 1950 to 2026. Rainfall levels and intervals are in inches.
+
+| Weight function | Stations kept | $n_{\text{eff}}$ | Pooled trend | 2026 100-year level (95% bootstrap interval) |
+|:--|--:|--:|--:|--:|
+| Linear: $w(d)=\max(0,1-d/25)$ | 4 | 1.93 | −3.83% | 13.68 (10.31–18.12) |
+| Linear: $w(d)=\max(0,1-d/50)$ | 20 | 6.13 | +9.83% | 16.24 (12.92–20.93) |
+| Region of influence: $w(d)=1$ if $d\le50$, otherwise $0$ | 20 | 20.00 | +17.79% | 17.56 (13.34–22.89) |
+| Inverse squared: $w(0)=1$; $w(d)=\min(1,(10/d)^2)$ if $0<d\le50$, otherwise $0$ | 20 | 3.45 | +3.76% | 15.19 (11.94–19.52) |
+| Exponential: $w(d)=\exp(-d/25)$, no cutoff | 816 | 9.68 | +16.28% | 16.61 (12.75–22.15) |
+
+The 25-mile linear setting (Linear: $w(d)=\max(0,1-d/25)$) is more vulnerable to variance because it uses only four stations. The 50-mile region of influence setting (Region of influence: $w(d)=1$ if $d\le50$, otherwise $0$) and the exponential setting (Exponential: $w(d)=\exp(-d/25)$) have greater potential for bias because they give more influence to distant stations.
+
+Galveston Island’s coastal rainfall is influenced by Gulf moisture and tropical storms, so inland stations may have different rainfall patterns.
+
+```{julia}
+using CSV, DataFrames, Dates, Distributions, Turing
+using Random, Statistics, Printf
+
+let
+    lab_dir = "/Users/canliu/PHD-Courses/26Fall/CEVE543/labs/CEVE543-F26-CL333-lab07"
+    B = 500
+    Random.seed!(543)
+
+    # 1. Read rainfall data
+    function read_station(block)
+        header, rows... = split(block, '\n')
+        fields = strip.(split(header, ','))
+        days = split.(rows)
+
+        DataFrame(
+            id = fields[1],
+            lat = parse(Float64, fields[end - 2]),
+            lon = parse(Float64, fields[end - 1]),
+            date = Date.(first.(days), dateformat"mm/dd/yyyy"),
+            rainfall = parse.(Float64, last.(days))
+        )
+    end
+
+    raw = read(joinpath(lab_dir, "dur01d_ams_na14v11.txt"), String)
+    raw = replace(raw, "\r\n" => "\n")
+    body = split(raw, '\n'; limit=2)[2]
+    blocks = split(strip(body), r"\n\s*\n")
+    data = reduce(vcat, read_station.(blocks))
+    data.year = year.(data.date)
+
+    # Keep only 1997–2017 for Scholes Field
+    filter!(r -> r.id != "79-0047" || 1997 <= r.year <= 2017, data)
+
+    # 2. Read CO₂ data
+    co2 = CSV.read(joinpath(lab_dir, "logCO2.csv"), DataFrame)
+    co2.x = (co2.log_CO2 .- log(280)) ./ log(2)
+
+    x2026 = log2(430 / 280)
+    x1950 = only(co2.x[co2.year .== 1950])
+
+    data = innerjoin(data, select(co2, :year, :x); on=:year)
+
+    # 3. Calculate distance from Scholes Field
+    target = first(data[data.id .== "79-0047", :])
+
+    function distance_miles(lat1, lon1, lat2, lon2)
+        a = sind((lat2 - lat1) / 2)^2 +
+            cosd(lat1) * cosd(lat2) * sind((lon2 - lon1) / 2)^2
+
+        2 * 3958.8 * asin(sqrt(clamp(a, 0.0, 1.0)))
+    end
+
+    data.miles = distance_miles.(
+        target.lat, target.lon, data.lat, data.lon
+    )
+
+    # 4. Weighted GEV model: all parameters shared
+    @model function comparison_gev(y, x, w)
+        μ0 ~ LogNormal(1.5, 0.5)
+        κ ~ LogNormal(-1, 0.5)
+        β ~ Normal(0, 0.5)
+        ξ ~ Uniform(-0.5, 0.5)
+
+        μ = μ0 .* exp.(β .* x)
+        σ = κ .* μ
+
+        if !all(isfinite.(σ) .& (σ .> 0))
+            Turing.@addlogprob! -Inf
+            return nothing
+        end
+
+        Turing.@addlogprob! sum(
+            w .* logpdf.(GeneralizedExtremeValue.(μ, σ, ξ), y)
+        )
+    end
+
+    function fit_model(y, x, w)
+        start = InitFromParams((
+            μ0 = median(y),
+            κ = std(y) / median(y),
+            β = 0.0,
+            ξ = 0.1
+        ))
+
+        fit = maximum_a_posteriori(
+            comparison_gev(y, x, w);
+            initial_params=start
+        )
+
+        if string(fit.optim_result.retcode) != "Success"
+            error("MAP fit did not converge: $(fit.optim_result.retcode)")
+        end
+
+        NamedTuple(fit.params)
+    end
+
+    function level_2026(fit)
+        μ = fit.μ0 * exp(fit.β * x2026)
+        quantile(GeneralizedExtremeValue(μ, fit.κ * μ, fit.ξ), 0.99)
+    end
+
+    trend_percent(fit) =
+        100 * (exp(fit.β * (x2026 - x1950)) - 1)
+
+    # 5. Weight functions to compare
+    settings = [
+        ("Linear, r=25 mi",
+         d -> max(0.0, 1 - d / 25)),
+
+        ("Linear, r=50 mi",
+         d -> max(0.0, 1 - d / 50)),
+
+        ("Region of influence, r=50 mi",
+         d -> d <= 50 ? 1.0 : 0.0),
+
+        ("Inverse squared, d0=10, r=50 mi",
+         d -> d > 50 ? 0.0 : d <= 10 ? 1.0 : (10 / d)^2),
+
+        ("Exponential, L=25 mi, no cutoff",
+         d -> exp(-d / 25))
+    ]
+
+    results = DataFrame(
+        setting = String[],
+        n_stations = Int[],
+        n_eff = Float64[],
+        trend_percent = Float64[],
+        level_2026_in = Float64[],
+        lower_95_in = Float64[],
+        upper_95_in = Float64[],
+        successful_bootstraps = Int[]
+    )
+
+    # 6. Fit each setting and bootstrap over whole years
+    for (label, weight_fn) in settings
+        println("\nRunning: ", label)
+        flush(stdout)
+
+        regional = copy(data)
+        regional.w = weight_fn.(regional.miles)
+        filter!(r -> r.w > 0, regional)
+
+        station_weights = unique(select(regional, :id, :w))
+        fit = fit_model(regional.rainfall, regional.x, regional.w)
+
+        years = sort(unique(regional.year))
+        year_rows = [findall(==(yr), regional.year) for yr in years]
+
+        boot_levels = Float64[]
+
+        for b in 1:B
+            selected = rand(1:length(years), length(years))
+            rows = reduce(vcat, year_rows[selected])
+
+            try
+                boot_fit = fit_model(
+                    regional.rainfall[rows],
+                    regional.x[rows],
+                    regional.w[rows]
+                )
+
+                level = level_2026(boot_fit)
+                isfinite(level) || error("Nonfinite return level")
+                push!(boot_levels, level)
+
+            catch err
+                err isa InterruptException && rethrow()
+                @warn "Bootstrap fit failed" setting=label replicate=b exception=err
+            end
+
+            if b % 100 == 0
+                println("  Bootstrap: $b / $B")
+                flush(stdout)
+            end
+        end
+
+        # Do not report an interval if too many fits failed
+        adequate = length(boot_levels) >= ceil(Int, 0.95 * B)
+
+        if length(boot_levels) < B
+            @warn "Inspect failed fits before using this interval" setting=label successful=length(boot_levels)
+        end
+
+        push!(results, (
+            label,
+            nrow(station_weights),
+            sum(station_weights.w),
+            trend_percent(fit),
+            level_2026(fit),
+            adequate ? quantile(boot_levels, 0.025) : NaN,
+            adequate ? quantile(boot_levels, 0.975) : NaN,
+            length(boot_levels)
+        ))
+    end
+
+    # 7. Print final table
+    for col in [
+        :n_eff, :trend_percent, :level_2026_in,
+        :lower_95_in, :upper_95_in
+    ]
+        results[!, col] = round.(results[!, col]; digits=2)
+    end
+
+    println("\nRainfall levels and bootstrap intervals are in inches.\n")
+    show(stdout, results; allrows=true, allcols=true)
+    println()
+end
+```
 
 ### Share only the trend and shape
 
@@ -558,12 +807,125 @@ end
 1. Scholes Field's row of `stations`.
 
 **Your answer:** Which parameters should be shared for Scholes Field, and why?
-
+I would share the trend $\beta$ and shape $\xi$, while keeping $\mu_0$ and $\kappa$ station-specific to preserve local rainfall differences. 
 
 ### Defend a choice
 
 **Your answer:** What is your estimate of the 100-year daily rainfall at Galveston Scholes Field in 2026, with an interval?
 Say which weight function and radius you chose, which parameters you shared, and which interval you report, and defend each choice.
+
+My estimate of the 2026 100-year daily rainfall at Galveston Scholes Field is 15.48 inches, with a 95% year-bootstrap interval of 10.45–21.12 inches.
+I chose inverse-distance-squared weights with $d_0=10$ miles and a 50-mile radius. This gives nearby stations more influence while reducing contributions from distant stations. I chose inverse-distance-squared weights because, from a geographical perspective, I expect rainfall similarity to decrease rapidly with distance.With further investigation, weights could incorporate indicators of climate similarity, rather than distance alone, to better identify stations representative of Galveston Island’s rainfall conditions.
+I shared the trend parameter $\beta$ and shape parameter $\xi$ because Scholes Field’s short record provides limited information about the long-term trend and tail shape. Borrowing information from nearby stations may improve their estimation, while station-specific $\mu_0$ and $\kappa$ preserve local rainfall differences.
+I report the year-bootstrap interval because it keeps each year’s observations together, preserving dependence across stations during shared storm events.
+
+```{julia}
+let
+    Random.seed!(543)
+
+    radius = 50.0
+    d0 = 10.0
+    B = 500
+    target_id = "79-0047"
+
+    # 1. Inverse-distance-squared weights
+    weight_fn(d) = d > radius ? 0.0 :
+                   d <= d0 ? 1.0 : (d0 / d)^2
+
+    data = copy(ann_max_texas)
+    data.w = weight_fn.(data.miles)
+    filter!(row -> row.w > 0, data)
+
+    # 2. Assign each station an integer index
+    station_ids = unique(data.id)
+    n_stations = length(station_ids)
+
+    id_to_index = Dict(id => i for (i, id) in enumerate(station_ids))
+    data.station_index = [id_to_index[id] for id in data.id]
+    target_index = id_to_index[target_id]
+
+    station_weights = unique(select(data, :id, :w))
+
+    # 3. Fit the shared-trend-and-shape model
+    function fit_shared(rows)
+        y = rows.prcp_in
+
+        start = InitFromParams((
+            μ0 = fill(median(y), n_stations),
+            κ = fill(std(y) / median(y), n_stations),
+            β = 0.0,
+            ξ = 0.1
+        ))
+
+        model = weighted_shared_trend(
+            y, rows.x, rows.station_index, rows.w, n_stations
+        )
+
+        fit = maximum_a_posteriori(model; initial_params=start)
+
+        if string(fit.optim_result.retcode) != "Success"
+            error("Fit did not converge: $(fit.optim_result.retcode)")
+        end
+
+        params = NamedTuple(fit.params)
+
+        # Return Scholes Field's parameters
+        (
+            μ0 = params.μ0[target_index],
+            κ = params.κ[target_index],
+            β = params.β,
+            ξ = params.ξ
+        )
+    end
+
+    target_fit = fit_shared(data)
+
+    # 4. Bootstrap whole years, preserving station indices
+    years = sort(unique(data.year))
+    year_rows = [findall(==(yr), data.year) for yr in years]
+
+    bootstrap_levels = Float64[]
+
+    for b in 1:B
+        picked = rand(1:length(years), length(years))
+        row_indices = reduce(vcat, year_rows[picked])
+        resampled = data[row_indices, :]
+
+        # Stop on failure rather than silently omit a replicate
+        boot_fit = try
+            fit_shared(resampled)
+        catch err
+            println("Bootstrap replicate $b failed. Inspect the error before reporting an interval.")
+            rethrow()
+        end
+
+        level = level_2026(boot_fit)
+        isfinite(level) || error("Nonfinite level at replicate $b")
+        push!(bootstrap_levels, level)
+
+        if b % 50 == 0
+            println("Bootstrap: $b / $B")
+            flush(stdout)
+        end
+    end
+
+    # 5. Print results
+    lower = quantile(bootstrap_levels, 0.025)
+    upper = quantile(bootstrap_levels, 0.975)
+
+    println("\nInverse-distance-squared weights: d0=10 mi, radius=50 mi")
+    println("Shared parameters: β and ξ")
+    @printf("Stations kept: %d\n", n_stations)
+    @printf("n_eff: %.2f\n", sum(station_weights.w))
+    @printf("Scholes Field μ0: %.2f\n", target_fit.μ0)
+    @printf("Scholes Field κ: %.2f\n", target_fit.κ)
+    @printf("Shared β: %.3f\n", target_fit.β)
+    @printf("Shared ξ: %.3f\n", target_fit.ξ)
+    @printf("Trend, 1950–2026: %+.2f%%\n", trend_percent(target_fit))
+    @printf("2026 100-year rainfall: %.2f inches\n", level_2026(target_fit))
+    @printf("95%% year-bootstrap interval: %.2f–%.2f inches\n", lower, upper)
+end
+```
 
 ## Turning it in
 
